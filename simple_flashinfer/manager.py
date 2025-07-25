@@ -2,6 +2,7 @@ import torch
 import math
 import pynvml
 import flashinfer
+import os
 from transformers.cache_utils import Cache
 
 def get_total_free_memory(index=0):
@@ -31,7 +32,12 @@ class AutoKVCacheManager:
         self.dtype_size = torch.tensor([], dtype=dtype).element_size()
 
         if total_gpu_mem_bytes is None:
-            total_gpu_mem_bytes = get_total_free_memory()
+            devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if devices is None:
+                devices = list(range(torch.cuda.device_count()))
+            else:
+                devices = [d.strip() for d in devices.split(',')]
+            total_gpu_mem_bytes = get_total_free_memory(int(devices[0]))
         
         usable_mem = int(total_gpu_mem_bytes * mem_utilization)
         per_token_bytes = num_kv_heads * head_dim * self.dtype_size * 2

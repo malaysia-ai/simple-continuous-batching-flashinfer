@@ -25,13 +25,23 @@ def parse_arguments():
         help='Enable hot loading (default: %(default)s, env: RELOAD)'
     )
     parser.add_argument(
-        'microsleep', type=float,
-        default=float(os.environ.get('DYNAMIC_BATCHING_MICROSLEEP', '1e-4')),
-        help='microsleep to group dynamic batching, 1 / 1e-4 = 10k steps for second (default: %(default)s, env: DYNAMIC_BATCHING_MICROSLEEP)'
+        '--microsleep', type=float,
+        default=float(os.environ.get('MICROSLEEP', '1e-4')),
+        help='microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: %(default)s, env: MICROSLEEP)'
+    )
+    parser.add_argument(
+        '--max_sequence', type=float,
+        default=float(os.environ.get('MAX_SEQUENCE', '128')),
+        help='max sequence aka batch size per filling or decoding (default: %(default)s, env: MAX_SEQUENCE)'
+    )
+    parser.add_argument(
+        '--memory_utilization', type=float,
+        default=float(os.environ.get('MEMORY_UTILIZATION', '0.9')),
+        help='memory utilization on free memory after load the model for automatic number of paging for paged attention (default: %(default)s, env: MEMORY_UTILIZATION)'
     )
     parser.add_argument(
         '--model',
-        default=os.environ.get('MODEL', 'Qwen/Qwen2.5-0.5B-Instruct'),
+        default=os.environ.get('MODEL', 'Qwen/Qwen3-0.6B-Base'),
         help='Model type (default: %(default)s, env: MODEL)'
     )
 
