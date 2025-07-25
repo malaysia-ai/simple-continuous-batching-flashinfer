@@ -16,10 +16,7 @@ def flashinfer_attention(
     prefill=True,
     **kwargs,
 ):
-    manager.append_paged_kv_cache(batch_ids, key, value)
-    if not prefill:
-        key, value = manager.get_kv_cache(batch_ids)
-    o = prefill_wrapper.run(query, key, value)
+    o = prefill_wrapper.run(query, manager.kv_cache[i])
     return o
 
 app = FastAPI()
