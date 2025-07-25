@@ -35,5 +35,5 @@ class ChatMessage(BaseModel):
             raise ValueError(f'Unsupported role: {self.role}')
 
 class ChatCompletionForm(Parameters):
-    messages: List[ChatMessage]
+    messages: List[ChatMessage] = [{'role': 'user', 'content': 'Hello!'}]
     stream: bool = False

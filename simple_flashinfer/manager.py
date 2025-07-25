@@ -53,6 +53,8 @@ class AutoKVCacheManager:
         self.batch_to_blocks = {}
         self.batch_to_page_lengths = {}
         self.batch_to_total_tokens = {}
+        self.prefill_layer_idx = 0
+        self.decode_layer_idx = 0
 
     def get_qo_indptr(self, batch_ids):
         indptr = [0]
