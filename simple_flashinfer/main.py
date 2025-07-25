@@ -10,13 +10,15 @@ def flashinfer_attention(
     query,
     key,
     value,
-    prefill_wrapper,
+    wrapper,
     manager,
-    batch_ids,
-    prefill=True,
     **kwargs,
 ):
-    o = prefill_wrapper.run(query, manager.kv_cache[i])
+    """
+    For prefilling, it will pass flashinfer.BatchPrefillWithPagedKVCacheWrapper
+    For step decoding, it will pass flashinfer.BatchDecodeWithPagedKVCacheWrapper
+    """
+    o = wrapper.run(query, manager.kv_cache[i])
     return o
 
 app = FastAPI()

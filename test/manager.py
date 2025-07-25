@@ -18,7 +18,21 @@ def block_diagonal_concat_inverted(*masks, dtype=torch.bfloat16):
     inverted_mask = torch.where(combined_mask == 1, torch.tensor(0, dtype=dtype), min_value)
     return inverted_mask.unsqueeze(0)
 
-class TestPrefill(unittest.TestCase):
+def step_attention_mask_flatten(seq_lens, dtype=torch.float16):
+    num_queries = len(seq_lens)
+    total_kv_cache_len = sum(seq_lens)
+    neg_inf = torch.finfo(dtype).min
+    mask = torch.full((1, 1, num_queries, total_kv_cache_len), neg_inf, dtype=dtype)
+    start = 0
+    for i, length in enumerate(seq_lens):
+        end = start + length
+        causal_mask = torch.triu(torch.full((length, length), neg_inf, dtype=dtype), diagonal=1)
+        mask[:, :, i, start:end] = causal_mask[-1, :]
+        start = end
+
+    return mask
+
+class TestManager(unittest.TestCase):
     def setUp(self):
         self.num_heads = 16
         self.head_dim = 128
@@ -52,6 +66,9 @@ class TestPrefill(unittest.TestCase):
 
         workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, "NHD"
+        )
+        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, "NHD"
         )
 
@@ -96,6 +113,36 @@ class TestPrefill(unittest.TestCase):
         k = self.k_at_layer[0][None].transpose(1, 2)
         v = self.v_at_layer[0][None].transpose(1, 2)
         output_sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask = masks[None])
+        output_sdpa = output_sdpa[0].transpose(0, 1).argmax(-1)
+
+        mean_match = (output_sdpa == o.argmax(-1)).float().mean()
+        self.assertGreaterEqual(mean_match, 0.99, "argmax mismatch")
+
+    def test_decoding_attention(self):
+
+        q_decode = torch.randn(len(self.lengths), self.num_heads, self.head_dim).half().to("cuda:0")
+
+        i = 0
+        self.decode_wrapper.plan(
+            self.kv_indptr,
+            self.kv_indices,
+            self.kv_last_page_len,
+            self.num_heads,
+            self.num_heads,
+            self.head_dim,
+            self.manager.block_size,
+            pos_encoding_mode="NONE",
+            data_type=torch.float16
+        )
+        
+        o = self.decode_wrapper.run(q_decode, self.manager.kv_cache[i])
+
+        q = q_decode[None].transpose(1, 2)
+        k = self.k_at_layer[0][None].transpose(1, 2)
+        v = self.v_at_layer[0][None].transpose(1, 2)
+
+        step_mask = step_attention_mask_flatten(self.lengths).cuda()
+        output_sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask = step_mask)
         output_sdpa = output_sdpa[0].transpose(0, 1).argmax(-1)
 
         mean_match = (output_sdpa == o.argmax(-1)).float().mean()
