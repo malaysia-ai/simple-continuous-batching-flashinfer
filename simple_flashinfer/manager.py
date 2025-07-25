@@ -1,17 +1,25 @@
 import torch
 import math
-from typing import Dict, List, Tuple
+import pynvml
+import flashinfer
+from transformers.cache_utils import Cache
+
+def get_total_free_memory(index=0):
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return info.free
 
 class AutoKVCacheManager:
     def __init__(
         self,
-        total_gpu_mem_bytes: int,
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
         block_size: int = 16,
         dtype: torch.dtype = torch.float16,
         layout: str = "NHD",
+        total_gpu_mem_bytes: int = None,
         mem_utilization: float = 0.9,
     ):
         self.num_layers = num_layers
@@ -21,17 +29,19 @@ class AutoKVCacheManager:
         self.dtype = dtype
         self.layout = layout.upper()
         self.dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+        if total_gpu_mem_bytes is None:
+            total_gpu_mem_bytes = get_total_free_memory()
         
         usable_mem = int(total_gpu_mem_bytes * mem_utilization)
         per_token_bytes = num_kv_heads * head_dim * self.dtype_size * 2
         per_block_per_layer = block_size * per_token_bytes
         self.max_blocks = usable_mem // (num_layers * per_block_per_layer)
 
-        self.k_cache = torch.zeros(
-            (self.max_blocks, block_size, num_kv_heads, head_dim),
+        self.kv_cache = torch.zeros(
+            (num_layers, self.max_blocks, 2, block_size, num_kv_heads, head_dim),
             dtype=dtype, device="cuda"
         )
-        self.v_cache = torch.zeros_like(self.k_cache)
 
         self.free_blocks = list(range(self.max_blocks))
         self.batch_to_blocks = {}
@@ -57,16 +67,14 @@ class AutoKVCacheManager:
 
         blocks = [self.free_blocks.pop() for _ in range(num_pages)]
         self.batch_to_blocks[batch_id] = blocks
-        self.batch_to_page_lengths[batch_id] = 0
+        self.batch_to_page_lengths[batch_id] = total_tokens % self.block_size
+        self.batch_to_total_tokens[batch_id] = total_tokens
         return blocks
 
     def free(self, batch_id):
         blocks = self.batch_to_blocks.pop(batch_id, [])
         self.free_blocks.extend(blocks)
         self.batch_to_page_lengths.pop(batch_id, None)
-
-    def get_paged_kv_cache(self):
-        return self.k_cache, self.v_cache
 
     def get_append_metadata(self, batch_ids):
         """Returns kv_indices, kv_indptr, kv_last_page_len for FlashInfer append."""
@@ -85,11 +93,32 @@ class AutoKVCacheManager:
             torch.tensor(kv_indptr, dtype=torch.int32, device="cuda"),
             torch.tensor(kv_last_page_len, dtype=torch.int32, device="cuda"),
         )
+    
+    def append_paged_kv_cache(self, batch_ids, key, value, append_indptr, layer_idx):
+        kv_indices, kv_indptr, kv_last_page_len = self.get_append_metadata(batch_ids)
+
+        seq_lens = flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, self.block_size)
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            append_indptr, seq_lens, append_indptr[-1]
+        )
+
+        flashinfer.page.append_paged_kv_cache(
+            append_key=key,
+            append_value=value,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=self.kv_cache[layer_idx],
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=self.layout,
+        )
+    
+    def get_kv_cache(self, batch_ids):
+        pass
+
 
     def append_tokens(self, batch_id, num_new_tokens):
-        """Update `kv_last_page_len` and allocate new pages if needed."""
-        if batch_id not in self.batch_to_blocks:
-            raise ValueError(f"Batch {batch_id} not allocated")
 
         current_len = self.batch_to_page_lengths.get(batch_id, 0)
         total_tokens = current_len + num_new_tokens
@@ -108,8 +137,6 @@ class AutoKVCacheManager:
 
     def stream_decode_step(self, batch_id):
         """Handles one streaming decode token per request."""
-        if batch_id not in self.batch_to_blocks:
-            raise ValueError(f"Batch {batch_id} not allocated")
 
         current_len = self.batch_to_page_lengths[batch_id]
 
@@ -121,3 +148,51 @@ class AutoKVCacheManager:
             self.batch_to_page_lengths[batch_id] = 0
 
         self.batch_to_page_lengths[batch_id] += 1
+
+"""
+For 4.53.3, CacheLayerMixin not yet exist in 4.53.1
+class ManagerLayer(CacheLayerMixin):
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs = None,
+    ) :
+        cache_position = cache_kwargs.get('cache_position')
+        batch_ids, lengths = [], []
+        for k, v in cache_position.items():
+            batch_ids.append(k)
+            lengths.append(v)
+        append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim = -1).cuda()
+        self.manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, self.layer_idx)
+        
+        return None, None
+
+class ManagerCache(Cache):
+    def __init__(self, manager, *args, **kwargs):
+        super().__init__(layer_classes=ManagerLayer, *args, **kwargs)
+        for i in range(len(self.layers)):
+            self.layers[i].layer_idx = i
+            self.layers[i].manager = manager
+"""
+
+class ManagerCache(Cache):
+    def __init__(self, manager) -> None:
+        super().__init__()
+        self.manager = manager
+    
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs = None,
+    ):
+        cache_position = cache_kwargs.get('cache_position')
+        batch_ids, lengths = [], []
+        for k, v in cache_position.items():
+            batch_ids.append(k)
+            lengths.append(v)
+        append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim = -1).cuda()
+        self.manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, self.layer_idx)
+        return None, None
