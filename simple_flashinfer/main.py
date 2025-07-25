@@ -46,7 +46,7 @@ def flashinfer_attention(
     return o.transpose(0, 1)[None], None
 
 def load_model():
-    global tokenizer, model, manager, cache
+    global tokenizer, model, manager
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(

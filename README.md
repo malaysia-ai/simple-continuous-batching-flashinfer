@@ -1,6 +1,6 @@
 # simple-continuous-batching-flashinfer
 
-Simple continuous batching using FlashInfer.
+Simple continuous batching CausalLM from HuggingFace Transformer using FlashInfer.
 
 ## how to install
 
