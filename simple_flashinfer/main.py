@@ -8,11 +8,50 @@ from .manager import AutoKVCacheManager
 from .parameters import ChatCompletionForm
 
 import torch
+import json
 import asyncio
 import flashinfer
 import uvicorn
 import time
 import uuid
+
+def multinomial_sample_one_no_sync(probs_sort):
+    q = torch.empty_like(probs_sort).exponential_(1)
+    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
+
+def logits_to_probs(
+    logits,
+    mask_penalty,
+    temperature=1.0,
+    top_k=None,
+    top_p=None,
+):
+    logits = logits / mask_penalty
+    if temperature > 0:
+        logits = logits / max(temperature, 1e-5)
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            pivot = v.select(-1, -1).unsqueeze(-1)
+            logits = torch.where(logits < pivot, -float("Inf"), logits)
+
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+
+        if top_p is not None:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            indices_to_remove = cumulative_probs > top_p
+            indices_to_remove[..., 1:] = indices_to_remove[..., :-1].clone()
+            indices_to_remove[..., 0] = 0
+            probs[sorted_indices[indices_to_remove]] = 0.0
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # renormalize
+
+        idx_next = multinomial_sample_one_no_sync(probs)
+    else:
+        probs = logits
+        idx_next = logits.argmax(-1, keepdim=True)
+
+    return idx_next, probs
 
 def flashinfer_attention(
     module,
@@ -95,95 +134,139 @@ async def add_request_id_and_time(request: Request, call_next):
         raise exception
     return response
 
-async def prefill():
+async def process_queue(queue, wrapper, is_prefill):
     need_sleep = True
     while True:
         if need_sleep:
             await asyncio.sleep(args.microsleep)
-        
+
         need_sleep = True
         batch = []
-        while not prefill_queue.empty():
+
+        while not queue.empty():
             try:
-                request = await asyncio.wait_for(prefill_queue.get(), timeout=1e-6)
+                request = await asyncio.wait_for(queue.get(), timeout=1e-6)
                 batch.append(request)
                 if len(batch) >= args.max_sequence:
                     need_sleep = False
                     break
-
             except asyncio.TimeoutError:
                 break
-            
-        if not len(batch):
+
+        if not batch:
             continue
-        
-        futures = [batch[i][0] for i in range(len(batch))]
-        inputs = [batch[i][1] for i in range(len(batch))]
-        uuids = [batch[i][2] for i in range(len(batch))]
+
+        futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
+        lengths = [inp.shape[0] for inp in inputs]
 
         try:
             with torch.no_grad():
-                lengths = [inputs[i].shape[0] for i in range(len(batch))]
-                position_ids = torch.cat([torch.arange(l) for l in lengths])[None].cuda()
+                position_ids = (
+                    torch.cat([torch.arange(l) for l in lengths])
+                    if is_prefill
+                    else torch.tensor(position_ids)
+                )[None].cuda()
                 input_ids = torch.concat(inputs)[None].cuda()
                 append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim=-1).to(torch.int32).cuda()
 
                 for no, l in enumerate(lengths):
-                    manager.allocate(uuids[no], l)
-                
+                    if is_prefill:
+                        manager.allocate(uuids[no], l)
+                    else:
+                        manager.append_tokens(uuids[no], l)
+
                 kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
                 num_heads = model.config.num_attention_heads
                 num_key_value_heads = model.config.num_key_value_heads
                 head_dim = model.config.head_dim
-                prefill_wrapper.plan(
-                    append_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_len,
-                    num_heads,
-                    num_key_value_heads,
-                    head_dim,
-                    manager.block_size,
-                    causal=True,
-                )
+                if is_prefill:
+                    wrapper.plan(
+                        append_indptr,
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_len,
+                        num_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        manager.block_size,
+                        causal=True,
+                    )
+                else:
+                    wrapper.plan(
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_len,
+                        num_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        manager.block_size,
+                        pos_encoding_mode="NONE",
+                        data_type=torch.float16
+                    )
+                setattr(manager, "prefill_layer_idx" if is_prefill else "decode_layer_idx", 0)
 
                 output = model(
                     input_ids=input_ids,
                     position_ids=position_ids,
-                    wrapper=prefill_wrapper,
+                    use_cache=False,
+                    wrapper=wrapper,
                     manager=manager,
-                    prefill=True,
+                    prefill=is_prefill,
                     batch_ids=uuids,
                     append_indptr=append_indptr,
                 )
-                print(output)
-        
+                for i, fut in enumerate(futures):
+                    fut.set_result((output.logits[0, lengths[i] - 1],))
+
         except Exception as e:
             for future in futures:
                 if not future.done():
                     future.set_exception(e)
 
-
+async def prefill():
+    await process_queue(prefill_queue, prefill_wrapper, is_prefill=True)
 
 async def step():
-    need_sleep = True
-    while True:
-        if need_sleep:
-            await asyncio.sleep(args.microsleep)
-
-async def stream(inputs, created, form, request):
+    await process_queue(step_queue, decode_wrapper, is_prefill=False)
     
+async def stream(inputs, created, form, request):
     uuid = request.state.request_id
+    mask_penalty = torch.ones((model.config.vocab_size,)).cuda()
     initial_length = inputs.shape[0]
     for k in range(form.max_tokens):
+        is_disconnected = await request.is_disconnected()
+        if is_disconnected:
+            break
+            
         if k == 0:
             q = prefill_queue
         else:
             q = step_queue
 
+        l = k + initial_length
         future = asyncio.Future()
-        await q.put((future, inputs, uuid))
+        await q.put((future, inputs, l, uuid))
         out = await future
+        logits = out[0]
+        idx_next, probs = logits_to_probs(
+            logits,
+            mask_penalty,
+            temperature=form.temperature,
+            top_k=form.top_k,
+            top_p=form.top_p
+        )
+        
+        mask_penalty[idx_next[0]] = form.repetition_penalty
+        token = tokenizer.decode(idx_next)
+        print(k, idx_next, token)
+
+        if k == 0:
+            request.state.time_first_token = time.time()
+        
+        if idx_next[0] == tokenizer.eos_token_id:
+            break
+
+        inputs = idx_next
 
         data = {
             'id': uuid,
@@ -206,11 +289,9 @@ async def stream(inputs, created, form, request):
         }
         yield json.dumps(data)
         await asyncio.sleep(0)
-        break
 
 @app.get('/')
 async def index(request: Request = None):
-    is_disconnected = await request.is_disconnected()
     return {'message': 'hello'}
 
 @app.get('/kv_cache')
@@ -240,10 +321,13 @@ async def chat_completions_main(
     else:
         tokens = []
         async for data in func:
-            if isinstance(data, ServerSentEvent):
+            if not isinstance(data, str):
                 continue
-            data = json.loads(data)
-            tokens.append(data['choices'][0]['delta']['content'])
+            try:
+                data = json.loads(data)
+                tokens.append(data['choices'][0]['delta']['content'])
+            except Exception as e:
+                pass
 
         data = {
             'id': request.state.request_id,
@@ -266,8 +350,8 @@ async def chat_completions_main(
             'system_fingerprint': None,
             'usage': {
                 'completion_tokens': len(tokens),
-                'prompt_tokens': len(inputs[0]),
-                'total_tokens': len(inputs[0]) + len(tokens),
+                'prompt_tokens': len(inputs),
+                'total_tokens': len(inputs) + len(tokens),
             }
         }
         r = data

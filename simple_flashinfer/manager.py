@@ -121,10 +121,6 @@ class AutoKVCacheManager:
             kv_last_page_len=kv_last_page_len,
             kv_layout=self.layout,
         )
-    
-    def get_kv_cache(self, batch_ids):
-        pass
-
 
     def append_tokens(self, batch_id, num_new_tokens):
 
@@ -142,65 +138,3 @@ class AutoKVCacheManager:
             self.batch_to_blocks[batch_id].append(new_page)
 
         self.batch_to_page_lengths[batch_id] = remaining
-
-    def stream_decode_step(self, batch_id):
-        """Handles one streaming decode token per request."""
-
-        current_len = self.batch_to_page_lengths[batch_id]
-
-        if current_len >= self.block_size:
-            if not self.free_blocks:
-                raise RuntimeError("Out of KV cache blocks for decode step")
-            new_page = self.free_blocks.pop()
-            self.batch_to_blocks[batch_id].append(new_page)
-            self.batch_to_page_lengths[batch_id] = 0
-
-        self.batch_to_page_lengths[batch_id] += 1
-
-"""
-For 4.53.3, CacheLayerMixin not yet exist in 4.53.1
-class ManagerLayer(CacheLayerMixin):
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        cache_kwargs = None,
-    ) :
-        cache_position = cache_kwargs.get('cache_position')
-        batch_ids, lengths = [], []
-        for k, v in cache_position.items():
-            batch_ids.append(k)
-            lengths.append(v)
-        append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim = -1).cuda()
-        self.manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, self.layer_idx)
-        
-        return None, None
-
-class ManagerCache(Cache):
-    def __init__(self, manager, *args, **kwargs):
-        super().__init__(layer_classes=ManagerLayer, *args, **kwargs)
-        for i in range(len(self.layers)):
-            self.layers[i].layer_idx = i
-            self.layers[i].manager = manager
-"""
-
-class ManagerCache(Cache):
-    def __init__(self, manager) -> None:
-        super().__init__()
-        self.manager = manager
-    
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs = None,
-    ):
-        cache_position = cache_kwargs.get('cache_position')
-        batch_ids, lengths = [], []
-        for k, v in cache_position.items():
-            batch_ids.append(k)
-            lengths.append(v)
-        append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim = -1).cuda()
-        self.manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, self.layer_idx)
-        return None, None
