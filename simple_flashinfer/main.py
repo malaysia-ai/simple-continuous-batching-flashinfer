@@ -35,6 +35,8 @@ def flashinfer_attention(
     query: [1, H, L, D]
     key: [1, H, L, D]
     value: [1, H, L, D]
+
+    While flashinfer input is [L, H, D]
     """
     wrapper = kwargs.get('wrapper')
     manager = kwargs.get('manager')
@@ -72,7 +74,13 @@ def flashinfer_attention(
         o = output_sdpa
 
     setattr(manager, layer_attr, layer_idx + 1)
-    return o.transpose(0, 1)[None], None
+    o = o[None]
+
+    """
+    Output shape should be,
+    [1, L, H, D]
+    """
+    return o, None
 
 def load_model():
     global tokenizer, model, manager
@@ -128,7 +136,11 @@ async def add_request_id_and_time(request: Request, call_next):
     manager.free(request.state.request_id)
     duration = time.perf_counter() - start_time
     logging.info(f'freeing kv cache from {request.state.request_id}')
-    logging.info(f"{request_id} completed in {duration:.4f}s")
+    logging.info(f"{request_id} completed in {duration:.4f} seconds")
+    total_token = getattr(request.state, 'total_token', None)
+    if total_token is not None:
+        tps = total_token/duration
+        logging.info(f"{request_id} {tps:.4f} TPS")
 
     if exception is not None:
         raise exception
@@ -214,7 +226,7 @@ async def process_queue(queue, wrapper, is_prefill):
                     append_indptr=append_indptr,
                 )
                 for i, fut in enumerate(futures):
-                    fut.set_result((output.logits[0, lengths[i] - 1],))
+                    fut.set_result((output.logits[0, append_indptr[i + 1] - 1],))
 
         except Exception as e:
             for future in futures:
@@ -286,6 +298,8 @@ async def stream(inputs, created, form, request):
         }
         yield json.dumps(data)
         await asyncio.sleep(0)
+    
+    request.state.total_token = k + initial_length
 
 @app.get('/')
 async def index(request: Request = None):
