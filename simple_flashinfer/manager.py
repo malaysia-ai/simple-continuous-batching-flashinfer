@@ -124,6 +124,9 @@ class AutoKVCacheManager:
 
     def append_tokens(self, batch_id, num_new_tokens):
 
+        if batch_id not in self.batch_to_blocks:
+            raise ValueError(f"{batch_id} not allocated")
+
         current_len = self.batch_to_page_lengths.get(batch_id, 0)
         total_tokens = current_len + num_new_tokens
 

@@ -47,8 +47,8 @@ options:
 
 ### Run Qwen/Qwen3-0.6B
 
-```
-python3.10 -m simple_flashinfer.main \
+```bash
+python3 -m simple_flashinfer.main \
 --host 0.0.0.0 --port 7088 --model Qwen/Qwen3-0.6B
 ```
 
@@ -57,5 +57,6 @@ python3.10 -m simple_flashinfer.main \
 The unit tests will cover page append, prefilling causal attention and step decoding causal attention,
 
 ```bash
-python3.10 -m unittest test.manager
+python3 -m unittest test.manager
+python3 -m unittest test.manager_append
 ```
