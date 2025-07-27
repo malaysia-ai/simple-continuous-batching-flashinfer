@@ -139,8 +139,8 @@ async def add_request_id_and_time(request: Request, call_next):
     logging.info(f"{request_id} completed in {duration:.4f} seconds")
     total_token = getattr(request.state, 'total_token', None)
     if total_token is not None:
-        tps = total_token/duration
-        logging.info(f"{request_id} {tps:.4f} TPS")
+        tps = total_token / duration
+        logging.info(f"{request_id}, total token: {total_token}, TPS: {tps:.4f}")
 
     if exception is not None:
         raise exception
@@ -322,7 +322,6 @@ async def chat_completions_main(
     request: Request = None,
 ):
     prompt = tokenizer.apply_chat_template(form.messages, tokenize=False, add_generation_prompt=True)
-    logging.info(f'request_id: {request.state.request_id}, prompt: {json.dumps(prompt)}')
     inputs = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False)[0]
 
     created = int(time.time())
