@@ -38,15 +38,16 @@ options:
   --loglevel LOGLEVEL   Logging level (default: INFO, env: LOGLEVEL)
   --reload RELOAD       Enable hot loading (default: False, env: RELOAD)
   --microsleep MICROSLEEP
-                        microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: 0.0001, env:
-                        MICROSLEEP)
+                        microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: 0.0001,
+                        env: MICROSLEEP)
   --max_sequence MAX_SEQUENCE
-                        max sequence aka batch size per filling or decoding (default: 128.0, env: MAX_SEQUENCE)
+                        max sequence aka batch size per filling or decoding (default: 128, env: MAX_SEQUENCE)
   --memory_utilization MEMORY_UTILIZATION
-                        memory utilization on free memory after load the model for automatic number of paging for paged attention
-                        (default: 0.9, env: MEMORY_UTILIZATION)
+                        memory utilization on free memory after load the model for automatic number of paging for paged
+                        attention (default: 0.9, env: MEMORY_UTILIZATION)
   --compare-sdpa-prefill COMPARE_SDPA_PREFILL
-                        Compare FlashInfer attention output with SDPA during prefill (default: False, env: COMPARE_SDPA_PREFILL)
+                        Compare FlashInfer attention output with SDPA during prefill (default: False, env:
+                        COMPARE_SDPA_PREFILL)
   --model MODEL         Model type (default: meta-llama/Llama-3.2-1B-Instruct, env: MODEL)
   --torch_dtype TORCH_DTYPE
                         Model type (default: float16, env: TORCH_DTYPE)
@@ -120,4 +121,4 @@ python3 -m unittest test.manager_append
 locust -f stress_test.py -P 7001 -H http://localhost:7088 -r 10 -u 50 -t 60
 ```
 
-<img src="pics/locust.png" width="50%">
+<img src="pics/locust-v2.png" width="50%">

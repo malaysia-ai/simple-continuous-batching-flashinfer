@@ -30,8 +30,8 @@ def parse_arguments():
         help='microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: %(default)s, env: MICROSLEEP)'
     )
     parser.add_argument(
-        '--max_sequence', type=float,
-        default=float(os.environ.get('MAX_SEQUENCE', '128')),
+        '--max_sequence', type=int,
+        default=int(os.environ.get('MAX_SEQUENCE', '128')),
         help='max sequence aka batch size per filling or decoding (default: %(default)s, env: MAX_SEQUENCE)'
     )
     parser.add_argument(

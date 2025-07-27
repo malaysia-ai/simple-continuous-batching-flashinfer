@@ -1,5 +1,5 @@
 from simple_flashinfer.env import args, logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi import HTTPException
 from sse_starlette import EventSourceResponse
 from transformers import AttentionInterface
@@ -84,7 +84,7 @@ def flashinfer_attention(
 
 def load_model():
     global tokenizer, model, manager
-    global num_layers, num_heads, num_key_value_heads, head_dim
+    global num_layers, num_heads, num_key_value_heads, head_dim, vocab_size
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
@@ -93,6 +93,7 @@ def load_model():
     config = model.config
     num_layers = config.num_hidden_layers
     num_heads = config.num_attention_heads
+    vocab_size = config.vocab_size
     num_key_value_heads = getattr(
         config, "num_key_value_heads", config.num_attention_heads // config.num_key_value_heads)
     head_dim = getattr(
@@ -103,6 +104,8 @@ def load_model():
         head_dim, 
         dtype=args.torch_dtype,
         mem_utilization=args.memory_utilization,
+        vocab_size=vocab_size,
+        seq_lens=args.max_sequence,
     )
 
 tokenizer = None
@@ -112,6 +115,7 @@ num_layers = None
 num_heads = None
 num_key_value_heads = None
 head_dim = None
+vocab_size = None
 AttentionInterface.register("flashinfer_attention", flashinfer_attention)
 workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
@@ -190,6 +194,7 @@ async def process_queue(queue, wrapper, is_prefill):
             continue
 
         futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
+        temperature, top_k, top_p = zip(*[(b[4], b[5], b[6]) for b in batch])
         lengths = [inp.shape[0] for inp in inputs]
 
         try:
@@ -246,8 +251,25 @@ async def process_queue(queue, wrapper, is_prefill):
                     batch_ids=uuids,
                     append_indptr=append_indptr,
                 )
+                logits = output.logits[0, append_indptr[1:] - 1]
+                temperature = torch.tensor(temperature).cuda()[None].T
+                top_k = torch.tensor(top_k).cuda()
+                top_p = torch.tensor(top_p).cuda()
+                mask_penalty = []
+                for uuid in uuids:
+                    mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
+                mask_penalty = torch.stack(mask_penalty)
+                idx_next = logits_to_probs(
+                    logits=logits,
+                    mask_penalty=mask_penalty,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+                tokens = tokenizer.batch_decode(idx_next)
+
                 for i, fut in enumerate(futures):
-                    fut.set_result((output.logits[0, append_indptr[i + 1] - 1],))
+                    fut.set_result((idx_next[i], tokens[i]))
 
         except Exception as e:
             for future in futures:
@@ -262,8 +284,10 @@ async def step():
     
 async def stream(inputs, created, form, request):
     uuid = request.state.request_id
-    mask_penalty = torch.ones((model.config.vocab_size,)).cuda()
     initial_length = inputs.shape[0]
+    temperature = max(1e-5, form.temperature)
+    top_k = vocab_size if form.top_k == 0 else form.top_k
+    top_p = 1.0 if form.top_p == 0 else form.top_p
     for k in range(form.max_tokens):
         is_disconnected = await request.is_disconnected()
         if is_disconnected:
@@ -276,19 +300,10 @@ async def stream(inputs, created, form, request):
 
         l = k + initial_length
         future = asyncio.Future()
-        await q.put((future, inputs, l, uuid))
+        await q.put((future, inputs, l, uuid, temperature, top_k, top_p))
         out = await future
-        logits = out[0]
-        idx_next, probs = logits_to_probs(
-            logits,
-            mask_penalty,
-            temperature=form.temperature,
-            top_k=form.top_k,
-            top_p=form.top_p
-        )
-        
-        mask_penalty[idx_next[0]] = form.repetition_penalty
-        token = tokenizer.decode(idx_next)
+        idx_next, token = out
+        manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next] = form.repetition_penalty
 
         if k == 0:
             request.state.time_first_token = time.time()

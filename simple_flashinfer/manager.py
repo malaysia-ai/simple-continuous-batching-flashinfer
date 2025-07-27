@@ -17,6 +17,8 @@ class AutoKVCacheManager:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
+        vocab_size: int = 10000,
+        seq_lens: int = 128,
         block_size: int = 16,
         dtype: torch.dtype = torch.float16,
         layout: str = "NHD",
@@ -26,10 +28,13 @@ class AutoKVCacheManager:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.vocab_size = vocab_size
+        self.seq_lens = seq_lens
         self.block_size = block_size
         self.dtype = dtype
         self.layout = layout.upper()
         self.dtype_size = torch.tensor([], dtype=dtype).element_size()
+        self.mask_penalty = torch.ones(seq_lens, vocab_size, dtype=dtype).cuda()
 
         if total_gpu_mem_bytes is None:
             devices = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -50,9 +55,11 @@ class AutoKVCacheManager:
         )
 
         self.free_blocks = list(range(self.max_blocks))
+        self.free_seq_lens = list(range(self.seq_lens))
         self.batch_to_blocks = {}
         self.batch_to_page_lengths = {}
         self.batch_to_total_tokens = {}
+        self.batch_to_seq_len = {}
         self.prefill_layer_idx = 0
         self.decode_layer_idx = 0
 
@@ -77,12 +84,19 @@ class AutoKVCacheManager:
         self.batch_to_blocks[batch_id] = blocks
         self.batch_to_page_lengths[batch_id] = total_tokens % self.block_size
         self.batch_to_total_tokens[batch_id] = total_tokens
+
+        seq_len = self.free_seq_lens.pop()
+        self.batch_to_seq_len[batch_id] = seq_len
+        self.mask_penalty[seq_len] = 1.0
         return blocks
 
     def free(self, batch_id):
         blocks = self.batch_to_blocks.pop(batch_id, [])
         self.free_blocks.extend(blocks)
         self.batch_to_page_lengths.pop(batch_id, None)
+        seq_len = self.batch_to_seq_len.pop(batch_id, None)
+        if seq_len is not None:
+            self.free_seq_lens.append(seq_len)
 
     def get_append_metadata(self, batch_ids):
         """Returns kv_indices, kv_indptr, kv_last_page_len for FlashInfer append."""
