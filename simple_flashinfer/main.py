@@ -126,24 +126,45 @@ async def add_request_id_and_time(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     start_time = time.perf_counter()
-    response = None
     exception = None
+
     try:
         response = await call_next(request)
     except Exception as e:
         exception = e
+        response = Response("Internal server error", status_code=500)
 
-    manager.free(request.state.request_id)
-    duration = time.perf_counter() - start_time
-    logging.info(f'freeing kv cache from {request.state.request_id}')
-    logging.info(f"{request_id} completed in {duration:.4f} seconds")
-    total_token = getattr(request.state, 'total_token', None)
-    if total_token is not None:
-        tps = total_token / duration
-        logging.info(f"{request_id}, total token: {total_token}, TPS: {tps:.4f}")
+    if hasattr(response, "body_iterator"):
+        original_iterator = response.body_iterator
+
+        async def streaming_wrapper():
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                duration = time.perf_counter() - start_time
+                manager.free(request.state.request_id)
+                logging.info(f'freeing kv cache from {request.state.request_id}')
+                logging.info(f"{request_id} completed in {duration:.4f} seconds")
+                total_token = getattr(request.state, 'total_token', None)
+                if total_token is not None:
+                    tps = total_token / duration
+                    logging.info(f"{request_id}, total token: {total_token}, TPS: {tps:.4f}")
+
+        response.body_iterator = streaming_wrapper()
+    else:
+        duration = time.perf_counter() - start_time
+        manager.free(request.state.request_id)
+        logging.info(f'freeing kv cache from {request.state.request_id}')
+        logging.info(f"{request_id} completed in {duration:.4f} seconds")
+        total_token = getattr(request.state, 'total_token', None)
+        if total_token is not None:
+            tps = total_token / duration
+            logging.info(f"{request_id}, total token: {total_token}, TPS: {tps:.4f}")
 
     if exception is not None:
         raise exception
+
     return response
 
 async def process_queue(queue, wrapper, is_prefill):
