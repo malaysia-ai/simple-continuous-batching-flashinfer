@@ -44,7 +44,6 @@ class TestManager(unittest.TestCase):
         append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim=-1).to(torch.int32).cuda()
         
         kv_indices, kv_indptr, kv_last_page_len = self.manager.get_append_metadata(batch_ids)
-        print(append_indptr, kv_indices, kv_indptr, kv_last_page_len)
 
         self.prefill_wrapper.plan(
             append_indptr,
@@ -95,7 +94,6 @@ class TestManager(unittest.TestCase):
         append_indptr_decode = torch.cumsum(torch.tensor([0] + lengths), dim=-1).to(torch.int32).cuda()
         
         kv_indices, kv_indptr, kv_last_page_len = self.manager.get_append_metadata(batch_ids)
-        print(append_indptr_decode, kv_indices, kv_indptr, kv_last_page_len)
 
         self.decode_wrapper.plan(
             kv_indptr,
@@ -135,7 +133,6 @@ class TestManager(unittest.TestCase):
         k = torch.concat(k).cuda()
         v = torch.concat(v).cuda()
 
-        print(k.shape, v.shape)
         # shape should 200 from the first length + 1 from the second length
         self.assertGreaterEqual(k.shape[0], 201, "argmax mismatch")
 
@@ -160,22 +157,16 @@ class TestManager(unittest.TestCase):
         actual_k = actual_k.transpose(0, 1)[None]
         actual_v = actual_v.transpose(0, 1)[None]
 
-        print(k.shape, actual_k.shape)
-
         q = q_at_layer[0, -1:].transpose(0, 1)[None]
-        print(q.shape, k.shape, v.shape)
 
         output_sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         output_sdpa = output_sdpa[0, :, 0]
 
         single_decode_with_kv_cache = flashinfer.decode.single_decode_with_kv_cache(
             q[0,:, 0], k[0].transpose(0, 1).contiguous(), v[0].transpose(0, 1).contiguous())
-
-        print(
-            output_sdpa.argmax(-1),
-            o[-1].argmax(-1), 
-            single_decode_with_kv_cache.argmax(-1),
-        )
+        
+        mean_match = (single_decode_with_kv_cache.argmax(-1) == o[-1].argmax(-1)).float().mean()
+        self.assertGreaterEqual(mean_match, 0.99, "argmax mismatch")
 
         mean_match = (output_sdpa.argmax(-1) == o[-1].argmax(-1)).float().mean()
         self.assertGreaterEqual(mean_match, 0.99, "argmax mismatch")

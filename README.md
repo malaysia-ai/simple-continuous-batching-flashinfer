@@ -21,8 +21,13 @@ git clone https://github.com/huseinzol05/simple-continuous-batching-flashinfer &
 ### Supported parameters
 
 ```bash
+python3 -m simple_flashinfer.main --help
+```
+
+```text
 usage: main.py [-h] [--host HOST] [--port PORT] [--loglevel LOGLEVEL] [--reload RELOAD] [--microsleep MICROSLEEP]
-               [--max_sequence MAX_SEQUENCE] [--memory_utilization MEMORY_UTILIZATION] [--model MODEL]
+               [--max_sequence MAX_SEQUENCE] [--memory_utilization MEMORY_UTILIZATION]
+               [--compare-sdpa-prefill COMPARE_SDPA_PREFILL] [--model MODEL] [--torch_dtype TORCH_DTYPE]
 
 Configuration parser
 
@@ -40,16 +45,20 @@ options:
   --memory_utilization MEMORY_UTILIZATION
                         memory utilization on free memory after load the model for automatic number of paging for paged attention
                         (default: 0.9, env: MEMORY_UTILIZATION)
-  --model MODEL         Model type (default: Qwen/Qwen3-0.6B-Base, env: MODEL)
+  --compare-sdpa-prefill COMPARE_SDPA_PREFILL
+                        Compare FlashInfer attention output with SDPA during prefill (default: False, env: COMPARE_SDPA_PREFILL)
+  --model MODEL         Model type (default: meta-llama/Llama-3.2-1B-Instruct, env: MODEL)
+  --torch_dtype TORCH_DTYPE
+                        Model type (default: float16, env: TORCH_DTYPE)
 ```
 
 **We support both args and OS environment**.
 
-### Run Qwen/Qwen3-0.6B
+### Run meta-llama/Llama-3.2-1B-Instruct
 
 ```bash
 python3 -m simple_flashinfer.main \
---host 0.0.0.0 --port 7088 --model Qwen/Qwen3-0.6B
+--host 0.0.0.0 --port 7088 --model meta-llama/Llama-3.2-1B-Instruct
 ```
 
 ## Unit tests

@@ -6,6 +6,10 @@ from transformers import AttentionInterface
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .manager import AutoKVCacheManager
 from .parameters import ChatCompletionForm
+from .utils import (
+    logits_to_probs,
+    block_diagonal_concat_inverted,
+)
 
 import torch
 import json
@@ -14,44 +18,6 @@ import flashinfer
 import uvicorn
 import time
 import uuid
-
-def multinomial_sample_one_no_sync(probs_sort):
-    q = torch.empty_like(probs_sort).exponential_(1)
-    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
-
-def logits_to_probs(
-    logits,
-    mask_penalty,
-    temperature=1.0,
-    top_k=None,
-    top_p=None,
-):
-    logits = logits / mask_penalty
-    if temperature > 0:
-        logits = logits / max(temperature, 1e-5)
-
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            pivot = v.select(-1, -1).unsqueeze(-1)
-            logits = torch.where(logits < pivot, -float("Inf"), logits)
-
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-
-        if top_p is not None:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            indices_to_remove = cumulative_probs > top_p
-            indices_to_remove[..., 1:] = indices_to_remove[..., :-1].clone()
-            indices_to_remove[..., 0] = 0
-            probs[sorted_indices[indices_to_remove]] = 0.0
-            probs = probs / probs.sum(dim=-1, keepdim=True)  # renormalize
-
-        idx_next = multinomial_sample_one_no_sync(probs)
-    else:
-        probs = logits
-        idx_next = logits.argmax(-1, keepdim=True)
-
-    return idx_next, probs
 
 def flashinfer_attention(
     module,
@@ -64,6 +30,11 @@ def flashinfer_attention(
     """
     For prefilling, it will pass flashinfer.BatchPrefillWithPagedKVCacheWrapper
     For step decoding, it will pass flashinfer.BatchDecodeWithPagedKVCacheWrapper
+
+    The shape should be,
+    query: [1, H, L, D]
+    key: [1, H, L, D]
+    value: [1, H, L, D]
     """
     wrapper = kwargs.get('wrapper')
     manager = kwargs.get('manager')
@@ -81,33 +52,63 @@ def flashinfer_attention(
     manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, layer_idx)
     o = wrapper.run(query, manager.kv_cache[layer_idx])
 
+    if args.compare_sdpa_prefill and prefill:
+        diff = torch.diff(append_indptr)
+        masks = []
+        for l in diff:
+            masks.append(torch.tril(torch.ones(l, l)))
+            
+        masks = block_diagonal_concat_inverted(*masks, dtype = query.dtype).cuda()
+        q = query.transpose(0, 1)[None]
+        k = key.transpose(0, 1)[None]
+        v = value.transpose(0, 1)[None]
+        enable_gqa = q.shape[1] != k.shape[1]
+        output_sdpa = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        output_sdpa = output_sdpa[0].transpose(0, 1)
+        mean_abs_diff = (output_sdpa - o).abs().mean()
+        allclose = torch.allclose(output_sdpa, o, atol=0.125, rtol=0)
+        logging.info(f'{layer_idx}, mean abs diff: {mean_abs_diff}, torch.allclose: {allclose}')
+        o = output_sdpa
+
     setattr(manager, layer_attr, layer_idx + 1)
     return o.transpose(0, 1)[None], None
 
 def load_model():
     global tokenizer, model, manager
+    global num_layers, num_heads, num_key_value_heads, head_dim
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, attn_implementation="flashinfer_attention", 
-        torch_dtype = torch.float16).cuda()
-    num_layers = model.config.num_hidden_layers
-    num_key_value_heads = model.config.num_key_value_heads
-    head_dim = model.config.head_dim
+        torch_dtype = args.torch_dtype).cuda()
+    config = model.config
+    num_layers = config.num_hidden_layers
+    num_heads = config.num_attention_heads
+    num_key_value_heads = getattr(
+        config, "num_key_value_heads", config.num_attention_heads // config.num_key_value_heads)
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads)
     manager = AutoKVCacheManager(
         num_layers, 
         num_key_value_heads, 
         head_dim, 
-        mem_utilization=args.memory_utilization
+        dtype=args.torch_dtype,
+        mem_utilization=args.memory_utilization,
     )
 
 tokenizer = None
 model = None
 manager = None
+num_layers = None
+num_heads = None
+num_key_value_heads = None
+head_dim = None
 AttentionInterface.register("flashinfer_attention", flashinfer_attention)
-workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
-prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
-decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
+workspace_buffer_decode = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer_decode, "NHD")
 prefill_queue = asyncio.Queue()
 step_queue = asyncio.Queue()
 app = FastAPI()
@@ -175,9 +176,6 @@ async def process_queue(queue, wrapper, is_prefill):
                         manager.append_tokens(uuids[no], l)
 
                 kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
-                num_heads = model.config.num_attention_heads
-                num_key_value_heads = model.config.num_key_value_heads
-                head_dim = model.config.head_dim
                 if is_prefill:
                     wrapper.plan(
                         append_indptr,
@@ -189,6 +187,7 @@ async def process_queue(queue, wrapper, is_prefill):
                         head_dim,
                         manager.block_size,
                         causal=True,
+                        q_data_type=args.torch_dtype,
                     )
                 else:
                     wrapper.plan(
@@ -200,7 +199,7 @@ async def process_queue(queue, wrapper, is_prefill):
                         head_dim,
                         manager.block_size,
                         pos_encoding_mode="NONE",
-                        data_type=torch.float16
+                        q_data_type=args.torch_dtype,
                     )
                 setattr(manager, "prefill_layer_idx" if is_prefill else "decode_layer_idx", 0)
 
@@ -257,7 +256,6 @@ async def stream(inputs, created, form, request):
         
         mask_penalty[idx_next[0]] = form.repetition_penalty
         token = tokenizer.decode(idx_next)
-        print(k, idx_next, token)
 
         if k == 0:
             request.state.time_first_token = time.time()
@@ -309,7 +307,8 @@ async def chat_completions_main(
     form: ChatCompletionForm,
     request: Request = None,
 ):
-    prompt = tokenizer.apply_chat_template(form.messages, tokenize=False)
+    prompt = tokenizer.apply_chat_template(form.messages, tokenize=False, add_generation_prompt=True)
+    logging.info(f'request_id: {request.state.request_id}, prompt: {json.dumps(prompt)}')
     inputs = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False)[0]
 
     created = int(time.time())

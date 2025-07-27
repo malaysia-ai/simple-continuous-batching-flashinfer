@@ -40,14 +40,28 @@ def parse_arguments():
         help='memory utilization on free memory after load the model for automatic number of paging for paged attention (default: %(default)s, env: MEMORY_UTILIZATION)'
     )
     parser.add_argument(
+        '--compare-sdpa-prefill', type=lambda x: x.lower() == 'true',
+        default=os.environ.get('COMPARE_SDPA_PREFILL', 'false').lower() == 'true',
+        help='Compare FlashInfer attention output with SDPA during prefill (default: %(default)s, env: COMPARE_SDPA_PREFILL)'
+    )
+    parser.add_argument(
         '--model',
-        default=os.environ.get('MODEL', 'Qwen/Qwen3-0.6B-Base'),
+        default=os.environ.get('MODEL', 'meta-llama/Llama-3.2-1B-Instruct'),
         help='Model type (default: %(default)s, env: MODEL)'
+    )
+    parser.add_argument(
+        '--torch_dtype',
+        default=os.environ.get('TORCH_DTYPE', 'float16'),
+        help='Model type (default: %(default)s, env: TORCH_DTYPE)'
     )
 
     args = parser.parse_args()
 
+    if args.torch_dtype not in {'float16', 'bfloat16'}:
+        raise ValueError('`--torch_dtype` only support `float16` or `bfloat16`')
+
     args.device = 'cuda'
+    args.torch_dtype = getattr(torch, args.torch_dtype)
     return args
 
 
