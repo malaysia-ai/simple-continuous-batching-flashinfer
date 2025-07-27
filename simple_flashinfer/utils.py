@@ -1,9 +1,5 @@
 import torch
 
-def multinomial_sample_one_no_sync(probs_sort):
-    q = torch.empty_like(probs_sort).exponential_(1)
-    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
-
 def logits_to_probs(
     logits,
     mask_penalty,
