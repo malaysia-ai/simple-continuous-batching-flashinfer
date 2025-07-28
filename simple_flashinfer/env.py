@@ -54,6 +54,12 @@ def parse_arguments():
         default=os.environ.get('TORCH_DTYPE', 'float16'),
         help='Model type (default: %(default)s, env: TORCH_DTYPE)'
     )
+    parser.add_argument(
+        '--torch-profiling',
+        type=lambda x: x.lower() == 'true',
+        default=os.environ.get('TORCH_PROFILING', 'false').lower() == 'true',
+        help='Use torch.autograd.profiler.profile() to profile prefill and step (default: %(default)s, env: TORCH_PROFILING)'
+    )
 
     args = parser.parse_args()
 

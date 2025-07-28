@@ -121,4 +121,4 @@ python3 -m unittest test.manager_append
 locust -f stress_test.py -P 7001 -H http://localhost:7088 -r 10 -u 50 -t 60
 ```
 
-<img src="pics/locust-v2.png" width="50%">
+<img src="pics/locust-v3.png" width="50%">

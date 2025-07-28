@@ -285,9 +285,16 @@ async def step():
 async def stream(inputs, created, form, request):
     uuid = request.state.request_id
     initial_length = inputs.shape[0]
+    inputs = inputs.cuda()
+
     temperature = max(1e-5, form.temperature)
     top_k = vocab_size if form.top_k == 0 else form.top_k
     top_p = 1.0 if form.top_p == 0 else form.top_p
+
+    top_k = torch.tensor([top_k]).cuda()
+    temperature = torch.tensor([temperature]).cuda()
+    top_p = torch.tensor([top_p]).cuda()
+    
     for k in range(form.max_tokens):
         is_disconnected = await request.is_disconnected()
         if is_disconnected:
