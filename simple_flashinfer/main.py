@@ -11,6 +11,7 @@ from .utils import (
     block_diagonal_concat_inverted,
 )
 
+from tqdm import tqdm
 import torch
 import json
 import asyncio
@@ -19,6 +20,7 @@ import uvicorn
 import time
 import uuid
 
+@torch.compiler.disable
 def flashinfer_attention(
     module,
     query,
@@ -108,6 +110,10 @@ def load_model():
         seq_lens=args.max_sequence,
     )
 
+
+def decode(*args, **kwargs):
+    return model(*args, **kwargs)
+
 tokenizer = None
 model = None
 manager = None
@@ -121,9 +127,15 @@ workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, dev
 prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
 workspace_buffer_decode = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer_decode, "NHD")
+empty_length = torch.tensor([0]).cuda()
+decode_length = torch.tensor([1]).cuda()
 prefill_queue = asyncio.Queue()
 step_queue = asyncio.Queue()
 app = FastAPI()
+
+if args.torch_compile:
+    logits_to_probs = torch.compile(logits_to_probs, mode=args.torch_compile_mode)
+    decode = torch.compile(decode, mode=args.torch_compile_mode)
 
 @app.middleware("http")
 async def add_request_id_and_time(request: Request, call_next):
@@ -194,24 +206,26 @@ async def process_queue(queue, wrapper, is_prefill):
             continue
 
         futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
-        temperature, top_k, top_p = zip(*[(b[4], b[5], b[6]) for b in batch])
-        lengths = [inp.shape[0] for inp in inputs]
+        temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
+        lengths_cpu = [inp.shape[0] for inp in inputs]
 
         try:
             with torch.no_grad():
                 position_ids = (
-                    torch.cat([torch.arange(l) for l in lengths])
+                    torch.cat([torch.arange(l) for l in lengths_cpu])
                     if is_prefill
                     else torch.tensor(position_ids)
                 )[None].cuda()
-                input_ids = torch.concat(inputs)[None].cuda()
-                append_indptr = torch.cumsum(torch.tensor([0] + lengths), dim=-1).to(torch.int32).cuda()
 
-                for no, l in enumerate(lengths):
+                for no, l in enumerate(lengths_cpu):
                     if is_prefill:
                         manager.allocate(uuids[no], l)
                     else:
                         manager.append_tokens(uuids[no], l)
+                    
+                input_ids = torch.concat(inputs)[None]
+                lengths = torch.concat([empty_length] + list(lengths))
+                append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
 
                 kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
                 if is_prefill:
@@ -241,7 +255,8 @@ async def process_queue(queue, wrapper, is_prefill):
                     )
                 setattr(manager, "prefill_layer_idx" if is_prefill else "decode_layer_idx", 0)
 
-                output = model(
+                forward = model if is_prefill else decode                    
+                output = forward(
                     input_ids=input_ids,
                     position_ids=position_ids,
                     use_cache=False,
@@ -252,9 +267,9 @@ async def process_queue(queue, wrapper, is_prefill):
                     append_indptr=append_indptr,
                 )
                 logits = output.logits[0, append_indptr[1:] - 1]
-                temperature = torch.tensor(temperature).cuda()[None].T
-                top_k = torch.tensor(top_k).cuda()
-                top_p = torch.tensor(top_p).cuda()
+                temperature = torch.concat(temperature)[None].T
+                top_k = torch.concat(top_k)
+                top_p = torch.concat(top_p)
                 mask_penalty = []
                 for uuid in uuids:
                     mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
@@ -294,6 +309,8 @@ async def stream(inputs, created, form, request):
     top_k = torch.tensor([top_k]).cuda()
     temperature = torch.tensor([temperature]).cuda()
     top_p = torch.tensor([top_p]).cuda()
+
+    prefill_l = torch.tensor([initial_length]).cuda()
     
     for k in range(form.max_tokens):
         is_disconnected = await request.is_disconnected()
@@ -302,12 +319,14 @@ async def stream(inputs, created, form, request):
             
         if k == 0:
             q = prefill_queue
+            length = prefill_l
         else:
             q = step_queue
+            length = decode_length
 
         l = k + initial_length
         future = asyncio.Future()
-        await q.put((future, inputs, l, uuid, temperature, top_k, top_p))
+        await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length))
         out = await future
         idx_next, token = out
         manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next] = form.repetition_penalty
@@ -424,6 +443,37 @@ async def startup_event():
     load_model()
     app.state.background_prefill = asyncio.create_task(prefill())
     app.state.background_step = asyncio.create_task(step())
+    form = ChatCompletionForm()
+
+    dummy_scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "headers": [],
+        "scheme": "http",
+        "path": "/",
+        "query_string": b"",
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    logging.info('warming up')
+    for _ in tqdm(range(2)):
+        request = Request(dummy_scope, receive=receive)
+        request.state.request_id = 'dummy'
+        r = await chat_completions_main(form=form, request=request)
+        manager.free(request.state.request_id)
+    
+    if args.torch_compile:
+        logging.info('warming up torch compile')
+        for _ in tqdm(range(3)):
+            request = Request(dummy_scope, receive=receive)
+            request.state.request_id = 'dummy'
+            r = await chat_completions_main(form=form, request=request)
+            manager.free(request.state.request_id)
     
 if __name__ == "__main__":
     uvicorn.run(
@@ -432,4 +482,5 @@ if __name__ == "__main__":
         port=args.port,
         log_level=args.loglevel.lower(),
         access_log=True,
+        loop="uvloop",
     )

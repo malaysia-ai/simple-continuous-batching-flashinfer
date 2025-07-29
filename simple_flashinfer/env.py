@@ -20,11 +20,6 @@ def parse_arguments():
         help='Logging level (default: %(default)s, env: LOGLEVEL)'
     )
     parser.add_argument(
-        '--reload', type=lambda x: x.lower() == 'true',
-        default=os.environ.get('reload', 'false').lower() == 'true',
-        help='Enable hot loading (default: %(default)s, env: RELOAD)'
-    )
-    parser.add_argument(
         '--microsleep', type=float,
         default=float(os.environ.get('MICROSLEEP', '1e-4')),
         help='microsleep to group batching to reduce CPU burden, 1 / 1e-4 = 10k steps for second (default: %(default)s, env: MICROSLEEP)'
@@ -59,6 +54,17 @@ def parse_arguments():
         type=lambda x: x.lower() == 'true',
         default=os.environ.get('TORCH_PROFILING', 'false').lower() == 'true',
         help='Use torch.autograd.profiler.profile() to profile prefill and step (default: %(default)s, env: TORCH_PROFILING)'
+    )
+    parser.add_argument(
+        '--torch-compile',
+        type=lambda x: x.lower() == 'true',
+        default=os.environ.get('TORCH_COMPILE', 'false').lower() == 'true',
+        help='Use torch.autograd.profiler.profile() to profile prefill and step (default: %(default)s, env: TORCH_COMPILE)'
+    )
+    parser.add_argument(
+        '--torch-compile-mode',
+        default=os.environ.get('TORCH_COMPILE_MODE', 'default'),
+        help='torch compile mode (default: %(default)s, env: TORCH_COMPILE_MODE)'
     )
 
     args = parser.parse_args()
