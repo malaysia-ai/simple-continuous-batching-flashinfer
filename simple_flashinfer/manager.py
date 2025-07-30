@@ -29,12 +29,12 @@ class AutoKVCacheManager:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.vocab_size = vocab_size
-        self.seq_lens = seq_lens
+        self.seq_lens = max(seq_lens, 128)
         self.block_size = block_size
         self.dtype = dtype
         self.layout = layout.upper()
         self.dtype_size = torch.tensor([], dtype=dtype).element_size()
-        self.mask_penalty = torch.ones(seq_lens, vocab_size, dtype=dtype).cuda()
+        self.mask_penalty = torch.ones(self.seq_lens, vocab_size, dtype=dtype).cuda()
 
         if total_gpu_mem_bytes is None:
             devices = os.environ.get('CUDA_VISIBLE_DEVICES')

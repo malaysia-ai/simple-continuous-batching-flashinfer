@@ -10,7 +10,7 @@ from .utils import (
     logits_to_probs,
     block_diagonal_concat_inverted,
 )
-
+from contextlib import nullcontext
 from tqdm import tqdm
 import torch
 import json
@@ -19,6 +19,8 @@ import flashinfer
 import uvicorn
 import time
 import uuid
+import traceback
+import os
 
 @torch.compiler.disable
 def flashinfer_attention(
@@ -46,6 +48,11 @@ def flashinfer_attention(
     batch_ids = kwargs.get('batch_ids')
     append_indptr = kwargs.get('append_indptr')
     
+    if args.need_autocast:
+        query = query.to(args.torch_dtype)
+        key = key.to(args.torch_dtype)
+        value = value.to(args.torch_dtype)
+
     query = query[0].transpose(0, 1)
     key = key[0].transpose(0, 1)
     value = value[0].transpose(0, 1)
@@ -82,6 +89,8 @@ def flashinfer_attention(
     Output shape should be,
     [1, L, H, D]
     """
+    if args.need_autocast:
+        o = o.to(args.model_dtype)
     return o, None
 
 def load_model():
@@ -91,7 +100,7 @@ def load_model():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, attn_implementation="flashinfer_attention", 
-        torch_dtype = args.torch_dtype).cuda()
+        torch_dtype = args.model_dtype).eval().cuda()
     config = model.config
     num_layers = config.num_hidden_layers
     num_heads = config.num_attention_heads
@@ -110,9 +119,34 @@ def load_model():
         seq_lens=args.max_sequence,
     )
 
+class CUDAGraphDecodeWrapper:
+    def __init__(self, decode_fn):
+        self.decode_fn = decode_fn
+        self.graphs = {}
+        self.static_inputs = {}
+        self.static_outputs = {}
+
+    def warmup(self, key, **inputs):
+        for k, v in inputs.items():
+            inputs[k] = v.contiguous()
+        self.static_inputs[key] = {k: v.clone().cuda() for k, v in inputs.items()}
+        self.static_outputs[key] = {}
+
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self.static_outputs[key] = self.decode_fn(**self.static_inputs[key])
+        self.graphs[key] = g
+
+    def run(self, key):
+        self.graphs[key].replay()
+        return self.static_outputs[key]
 
 def decode(*args, **kwargs):
     return model(*args, **kwargs)
+
+def decode_logits_to_probs(*args, **kwargs):
+    return logits_to_probs(*args, **kwargs)
 
 tokenizer = None
 model = None
@@ -132,10 +166,6 @@ decode_length = torch.tensor([1]).cuda()
 prefill_queue = asyncio.Queue()
 step_queue = asyncio.Queue()
 app = FastAPI()
-
-if args.torch_compile:
-    logits_to_probs = torch.compile(logits_to_probs, mode=args.torch_compile_mode)
-    decode = torch.compile(decode, mode=args.torch_compile_mode)
 
 @app.middleware("http")
 async def add_request_id_and_time(request: Request, call_next):
@@ -202,7 +232,7 @@ async def process_queue(queue, wrapper, is_prefill):
             except asyncio.TimeoutError:
                 break
 
-        if not batch:
+        if not len(batch):
             continue
 
         futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
@@ -255,7 +285,7 @@ async def process_queue(queue, wrapper, is_prefill):
                     )
                 setattr(manager, "prefill_layer_idx" if is_prefill else "decode_layer_idx", 0)
 
-                forward = model if is_prefill else decode                    
+                forward = model if is_prefill else decode
                 output = forward(
                     input_ids=input_ids,
                     position_ids=position_ids,
@@ -274,7 +304,8 @@ async def process_queue(queue, wrapper, is_prefill):
                 for uuid in uuids:
                     mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
                 mask_penalty = torch.stack(mask_penalty)
-                idx_next = logits_to_probs(
+                sampling = logits_to_probs if is_prefill else decode_logits_to_probs
+                idx_next = sampling(
                     logits=logits,
                     mask_penalty=mask_penalty,
                     temperature=temperature,
@@ -336,6 +367,13 @@ async def stream(inputs, created, form, request):
         
         if idx_next[0] == tokenizer.eos_token_id:
             break
+
+        if args.torch_compile:
+            """
+            I got weird overflow if not clone like (tensor([5256919935786303302], device='cuda:0'),)
+            This will hit CUDA indexing assertion.
+            """
+            idx_next = idx_next.clone()
 
         inputs = idx_next
 
@@ -443,8 +481,9 @@ async def startup_event():
     load_model()
     app.state.background_prefill = asyncio.create_task(prefill())
     app.state.background_step = asyncio.create_task(step())
-    form = ChatCompletionForm()
 
+    logging.info('warming up')
+    form = ChatCompletionForm()
     dummy_scope = {
         "type": "http",
         "http_version": "1.1",
@@ -460,20 +499,29 @@ async def startup_event():
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
-    logging.info('warming up')
-    for _ in tqdm(range(2)):
-        request = Request(dummy_scope, receive=receive)
+    for _ in tqdm(range(2), desc='warming up FlashInfer'):
+        request = Request(dummy_scope.copy(), receive=receive)
         request.state.request_id = 'dummy'
         r = await chat_completions_main(form=form, request=request)
         manager.free(request.state.request_id)
     
     if args.torch_compile:
-        logging.info('warming up torch compile')
-        for _ in tqdm(range(3)):
-            request = Request(dummy_scope, receive=receive)
-            request.state.request_id = 'dummy'
-            r = await chat_completions_main(form=form, request=request)
-            manager.free(request.state.request_id)
+        global logits_to_probs, decode
+
+        logits_to_probs = torch.compile(logits_to_probs, mode=args.torch_compile_mode)
+        decode = torch.compile(decode, mode=args.torch_compile_mode)
+        for i in tqdm(range(args.max_sequence), desc='warming up torch compile'):
+            tasks = []
+            for k in range(i + 1):
+                request = Request(dummy_scope.copy(), receive=receive)
+                request.state.request_id = f'dummy-{k}'
+                task = asyncio.create_task(chat_completions_main(form=form, request=request))
+                tasks.append(task)
+            
+            await asyncio.gather(*tasks)
+
+            for k in range(i + 1):
+                manager.free(f'dummy-{k}')
     
 if __name__ == "__main__":
     uvicorn.run(
