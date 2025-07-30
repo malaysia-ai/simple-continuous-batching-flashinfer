@@ -145,9 +145,6 @@ class CUDAGraphDecodeWrapper:
 def decode(*args, **kwargs):
     return model(*args, **kwargs)
 
-def decode_logits_to_probs(*args, **kwargs):
-    return logits_to_probs(*args, **kwargs)
-
 tokenizer = None
 model = None
 manager = None
@@ -304,8 +301,7 @@ async def process_queue(queue, wrapper, is_prefill):
                 for uuid in uuids:
                     mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
                 mask_penalty = torch.stack(mask_penalty)
-                sampling = logits_to_probs if is_prefill else decode_logits_to_probs
-                idx_next = sampling(
+                idx_next = logits_to_probs(
                     logits=logits,
                     mask_penalty=mask_penalty,
                     temperature=temperature,
