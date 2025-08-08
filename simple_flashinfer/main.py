@@ -10,7 +10,6 @@ from .utils import (
     logits_to_probs,
     block_diagonal_concat_inverted,
 )
-from contextlib import nullcontext
 from tqdm import tqdm
 import torch
 import json
@@ -45,7 +44,6 @@ def flashinfer_attention(
     wrapper = kwargs.get('wrapper')
     manager = kwargs.get('manager')
     prefill = kwargs.get('prefill')
-    batch_ids = kwargs.get('batch_ids')
     append_indptr = kwargs.get('append_indptr')
     
     if args.need_autocast:
@@ -59,6 +57,9 @@ def flashinfer_attention(
 
     layer_attr = 'prefill_layer_idx' if prefill else 'decode_layer_idx'
     layer_idx = getattr(manager, layer_attr)
+
+    batch_attr = 'prefill_batch_ids' if prefill else 'decode_batch_ids'
+    batch_ids = getattr(manager, batch_attr)
 
     manager.append_paged_kv_cache(batch_ids, key, value, append_indptr, layer_idx)
     o = wrapper.run(query, manager.kv_cache[layer_idx])
@@ -137,8 +138,11 @@ class CUDAGraphDecodeWrapper:
         with torch.cuda.graph(g):
             self.static_outputs[key] = self.decode_fn(**self.static_inputs[key])
         self.graphs[key] = g
-
-    def run(self, key):
+    
+    def run(self, key, **new_inputs):
+        for k in new_inputs:
+            if isinstance(new_inputs[k], torch.Tensor):
+                self.static_inputs[key][k].copy_(new_inputs[k])
         self.graphs[key].replay()
         return self.static_outputs[key]
 
@@ -210,7 +214,7 @@ async def add_request_id_and_time(request: Request, call_next):
 
     return response
 
-async def process_queue(queue, wrapper, is_prefill):
+async def process_queue(queue, wrapper, prefill):
     need_sleep = True
     while True:
         if need_sleep:
@@ -240,12 +244,12 @@ async def process_queue(queue, wrapper, is_prefill):
             with torch.no_grad():
                 position_ids = (
                     torch.cat([torch.arange(l) for l in lengths_cpu])
-                    if is_prefill
+                    if prefill
                     else torch.tensor(position_ids)
                 )[None].cuda()
 
                 for no, l in enumerate(lengths_cpu):
-                    if is_prefill:
+                    if prefill:
                         manager.allocate(uuids[no], l)
                     else:
                         manager.append_tokens(uuids[no], l)
@@ -255,7 +259,7 @@ async def process_queue(queue, wrapper, is_prefill):
                 append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
 
                 kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
-                if is_prefill:
+                if prefill:
                     wrapper.plan(
                         append_indptr,
                         kv_indptr,
@@ -280,17 +284,17 @@ async def process_queue(queue, wrapper, is_prefill):
                         pos_encoding_mode="NONE",
                         q_data_type=args.torch_dtype,
                     )
-                setattr(manager, "prefill_layer_idx" if is_prefill else "decode_layer_idx", 0)
+                setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
+                setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
-                forward = model if is_prefill else decode
+                forward = model if prefill else decode
                 output = forward(
                     input_ids=input_ids,
                     position_ids=position_ids,
                     use_cache=False,
                     wrapper=wrapper,
                     manager=manager,
-                    prefill=is_prefill,
-                    batch_ids=uuids,
+                    prefill=prefill,
                     append_indptr=append_indptr,
                 )
                 logits = output.logits[0, append_indptr[1:] - 1]
@@ -301,13 +305,12 @@ async def process_queue(queue, wrapper, is_prefill):
                 for uuid in uuids:
                     mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
                 mask_penalty = torch.stack(mask_penalty)
-                idx_next = logits_to_probs(
-                    logits=logits,
-                    mask_penalty=mask_penalty,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
+                logits = logits / mask_penalty
+                logits = logits / temperature
+
+                idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                    logits, top_k=top_k, top_p=top_p,
+                )[None].T
                 tokens = tokenizer.batch_decode(idx_next)
 
                 for i, fut in enumerate(futures):
@@ -319,10 +322,10 @@ async def process_queue(queue, wrapper, is_prefill):
                     future.set_exception(e)
 
 async def prefill():
-    await process_queue(prefill_queue, prefill_wrapper, is_prefill=True)
+    await process_queue(prefill_queue, prefill_wrapper, prefill=True)
 
 async def step():
-    await process_queue(step_queue, decode_wrapper, is_prefill=False)
+    await process_queue(step_queue, decode_wrapper, prefill=False)
     
 async def stream(inputs, created, form, request):
     uuid = request.state.request_id
@@ -330,12 +333,10 @@ async def stream(inputs, created, form, request):
     inputs = inputs.cuda()
 
     temperature = max(1e-5, form.temperature)
-    top_k = vocab_size if form.top_k == 0 else form.top_k
-    top_p = 1.0 if form.top_p == 0 else form.top_p
-
-    top_k = torch.tensor([top_k]).cuda()
+    
     temperature = torch.tensor([temperature]).cuda()
-    top_p = torch.tensor([top_p]).cuda()
+    top_k = torch.tensor([form.top_k]).to(torch.int32).cuda()
+    top_p = torch.tensor([form.top_p]).cuda()
 
     prefill_l = torch.tensor([initial_length]).cuda()
     
@@ -356,7 +357,7 @@ async def stream(inputs, created, form, request):
         await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length))
         out = await future
         idx_next, token = out
-        manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next] = form.repetition_penalty
+        manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] = form.repetition_penalty
 
         if k == 0:
             request.state.time_first_token = time.time()
@@ -366,7 +367,7 @@ async def stream(inputs, created, form, request):
 
         if args.torch_compile:
             """
-            I got weird overflow if not clone like (tensor([5256919935786303302], device='cuda:0'),)
+            I got weird overflow if not clone, like (tensor([5256919935786303302], device='cuda:0'),)
             This will hit CUDA indexing assertion.
             """
             idx_next = idx_next.clone()
@@ -502,9 +503,8 @@ async def startup_event():
         manager.free(request.state.request_id)
     
     if args.torch_compile:
-        global logits_to_probs, decode
+        global decode
 
-        logits_to_probs = torch.compile(logits_to_probs, mode=args.torch_compile_mode)
         decode = torch.compile(decode, mode=args.torch_compile_mode)
         for i in tqdm(range(args.max_sequence), desc='warming up torch compile'):
             tasks = []

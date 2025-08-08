@@ -2,6 +2,10 @@
 
 Simple continuous batching CausalLM from HuggingFace Transformer using FlashInfer.
 
+1. Simple page KV cache manager.
+2. Torch compile support.
+3. FP32 support but downcast and upcast attention forward.
+
 ## how to install
 
 Using PIP with git,
