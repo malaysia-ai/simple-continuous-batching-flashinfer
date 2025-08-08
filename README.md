@@ -177,7 +177,7 @@ Because compiling takes a very long time, we just stress test 20 users same size
 locust -f stress_test.py -P 7001 -H http://localhost:7088 -r 10 -u 20 -t 60
 ```
 
-The stress test done on transformers==4.53.1, torch==2.7.1 and flashinfer-python==0.2.8
+The stress test done on `transformers==4.53.1`, `torch==2.7.1` and `flashinfer-python==0.2.8`.
 
 #### Disable
 
