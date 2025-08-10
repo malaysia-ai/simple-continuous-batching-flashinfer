@@ -3,11 +3,13 @@ from typing import Union, List, Optional
 
 class Parameters(BaseModel):
     model: str = 'model'
-    temperature: float = 0.9
+    temperature: float = 1.0
     top_p: float = 0
     top_k: int = 0
     max_tokens: int = 256
     repetition_penalty: float = 1.0
+    ignore_eos: bool = False
+    stream: bool = False
 
 class ChatMessage(BaseModel):
     role: Optional[str] = 'user'
@@ -36,4 +38,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionForm(Parameters):
     messages: List[ChatMessage] = [{'role': 'user', 'content': 'Hello!'}]
-    stream: bool = False
+
+class CompletionForm(Parameters):
+    prompt: str = 'Hello!'
+    

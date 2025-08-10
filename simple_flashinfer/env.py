@@ -3,6 +3,7 @@ import logging
 import os
 import torch
 
+torch.set_grad_enabled(False)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Configuration parser')

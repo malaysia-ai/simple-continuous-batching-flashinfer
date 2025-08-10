@@ -5,7 +5,7 @@ from sse_starlette import EventSourceResponse
 from transformers import AttentionInterface
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .manager import AutoKVCacheManager
-from .parameters import ChatCompletionForm
+from .parameters import ChatCompletionForm, CompletionForm
 from .utils import (
     logits_to_probs,
     block_diagonal_concat_inverted,
@@ -241,80 +241,82 @@ async def process_queue(queue, wrapper, prefill):
         lengths_cpu = [inp.shape[0] for inp in inputs]
 
         try:
-            with torch.no_grad():
-                position_ids = (
-                    torch.cat([torch.arange(l) for l in lengths_cpu])
-                    if prefill
-                    else torch.tensor(position_ids)
-                )[None].cuda()
+            position_ids = (
+                torch.cat([torch.arange(l) for l in lengths_cpu])
+                if prefill
+                else torch.tensor(position_ids)
+            )[None].cuda()
 
-                for no, l in enumerate(lengths_cpu):
-                    if prefill:
-                        manager.allocate(uuids[no], l)
-                    else:
-                        manager.append_tokens(uuids[no], l)
-                    
-                input_ids = torch.concat(inputs)[None]
-                lengths = torch.concat([empty_length] + list(lengths))
-                append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
-
-                kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
+            for no, l in enumerate(lengths_cpu):
                 if prefill:
-                    wrapper.plan(
-                        append_indptr,
-                        kv_indptr,
-                        kv_indices,
-                        kv_last_page_len,
-                        num_heads,
-                        num_key_value_heads,
-                        head_dim,
-                        manager.block_size,
-                        causal=True,
-                        q_data_type=args.torch_dtype,
-                    )
+                    manager.allocate(uuids[no], l)
                 else:
-                    wrapper.plan(
-                        kv_indptr,
-                        kv_indices,
-                        kv_last_page_len,
-                        num_heads,
-                        num_key_value_heads,
-                        head_dim,
-                        manager.block_size,
-                        pos_encoding_mode="NONE",
-                        q_data_type=args.torch_dtype,
-                    )
-                setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
-                setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
+                    manager.append_tokens(uuids[no], l)
+                
+            input_ids = torch.concat(inputs)[None]
+            lengths = torch.concat([empty_length] + list(lengths))
+            append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
 
-                forward = model if prefill else decode
-                output = forward(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    use_cache=False,
-                    wrapper=wrapper,
-                    manager=manager,
-                    prefill=prefill,
-                    append_indptr=append_indptr,
+            kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
+            if prefill:
+                wrapper.plan(
+                    append_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_len,
+                    num_heads,
+                    num_key_value_heads,
+                    head_dim,
+                    manager.block_size,
+                    causal=True,
+                    q_data_type=args.torch_dtype,
                 )
-                logits = output.logits[0, append_indptr[1:] - 1]
-                temperature = torch.concat(temperature)[None].T
-                top_k = torch.concat(top_k)
-                top_p = torch.concat(top_p)
-                mask_penalty = []
-                for uuid in uuids:
-                    mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
-                mask_penalty = torch.stack(mask_penalty)
-                logits = logits / mask_penalty
-                logits = logits / temperature
+            else:
+                wrapper.plan(
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_len,
+                    num_heads,
+                    num_key_value_heads,
+                    head_dim,
+                    manager.block_size,
+                    pos_encoding_mode="NONE",
+                    q_data_type=args.torch_dtype,
+                )
+            setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
+            setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
-                idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                    logits, top_k=top_k, top_p=top_p,
-                )[None].T
-                tokens = tokenizer.batch_decode(idx_next)
+            forward = model if prefill else decode
+            output = forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                use_cache=False,
+                wrapper=wrapper,
+                manager=manager,
+                prefill=prefill,
+                append_indptr=append_indptr,
+            )
+            logits = output.logits[0, append_indptr[1:] - 1]
+            temperature = torch.concat(temperature)[None].T
+            top_k = torch.concat(top_k)
+            top_p = torch.concat(top_p)
 
-                for i, fut in enumerate(futures):
-                    fut.set_result((idx_next[i], tokens[i]))
+            mask_penalty = []
+            for uuid in uuids:
+                mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
+            mask_penalty = torch.stack(mask_penalty)
+
+            logits = logits / mask_penalty
+            logits = logits / temperature
+
+            idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                logits, top_k=top_k, top_p=top_p, deterministic=True,
+            )[None].T
+
+            tokens = tokenizer.batch_decode(idx_next)
+
+            for i, fut in enumerate(futures):
+                fut.set_result((idx_next[i], tokens[i]))
 
         except Exception as e:
             for future in futures:
@@ -333,10 +335,13 @@ async def stream(inputs, created, form, request):
     inputs = inputs.cuda()
 
     temperature = max(1e-5, form.temperature)
-    
     temperature = torch.tensor([temperature]).cuda()
-    top_k = torch.tensor([form.top_k]).to(torch.int32).cuda()
-    top_p = torch.tensor([form.top_p]).cuda()
+
+    top_k = vocab_size if form.top_k == 0 else form.top_k
+    top_k = torch.tensor([top_k]).to(torch.int32).cuda()
+
+    top_p = 1.0 if form.top_p == 0 else form.top_p
+    top_p = torch.tensor([top_p]).to(torch.float32).cuda()
 
     prefill_l = torch.tensor([initial_length]).cuda()
     
@@ -357,12 +362,16 @@ async def stream(inputs, created, form, request):
         await q.put((future, inputs, l, uuid, temperature, top_k, top_p, length))
         out = await future
         idx_next, token = out
-        manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] = form.repetition_penalty
+
+        if form.repetition_penalty > 1:
+            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= form.repetition_penalty
+        else:
+            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= form.repetition_penalty
 
         if k == 0:
             request.state.time_first_token = time.time()
         
-        if idx_next[0] == tokenizer.eos_token_id:
+        if not form.ignore_eos and idx_next[0] == tokenizer.eos_token_id:
             break
 
         if args.torch_compile:
@@ -374,26 +383,7 @@ async def stream(inputs, created, form, request):
 
         inputs = idx_next
 
-        data = {
-            'id': uuid,
-            'choices': [
-                {'delta': {
-                    'content': token,
-                    'function_call': None,
-                    'role': None,
-                    'tool_calls': None
-                },
-                    'finish_reason': None,
-                    'index': 0,
-                    'logprobs': None
-                }
-            ],
-            'created': created,
-            'model': 'model',
-            'object': 'chat.completion.chunk',
-            'system_fingerprint': None
-        }
-        yield json.dumps(data)
+        yield token
         await asyncio.sleep(0)
     
     request.state.total_token = k + initial_length
@@ -413,65 +403,136 @@ async def index(request: Request = None):
         'utilized_kv_cache': utilized_kv_cache,
     }
 
-@app.post('/chat/completions')
-async def chat_completions_main(
-    form: ChatCompletionForm,
-    request: Request = None,
-):
-    prompt = tokenizer.apply_chat_template(form.messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False)[0]
-
-    created = int(time.time())
-    func = stream(inputs=inputs, created=created, form=form, request=request)
-
-    if form.stream:
-        r = func
-    else:
-        tokens = []
+async def handle_stream_response(func, created, request_id, stream_type="completion"):
+    async def generator():
         async for data in func:
             if not isinstance(data, str):
                 continue
-            try:
-                data = json.loads(data)
-                tokens.append(data['choices'][0]['delta']['content'])
-            except Exception as e:
-                pass
+            
+            if stream_type == "chat":
+                payload = {
+                    'id': request_id,
+                    'choices': [
+                        {
+                            'delta': {
+                                'content': data,
+                                'function_call': None,
+                                'role': None,
+                                'tool_calls': None
+                            },
+                            'finish_reason': None,
+                            'index': 0,
+                            'logprobs': None
+                        }
+                    ],
+                    'created': created,
+                    'model': 'model',
+                    'object': 'chat.completion.chunk',
+                    'system_fingerprint': None
+                }
+            else:
+                payload = {
+                    'id': request_id,
+                    'choices': [
+                        {
+                            'text': data,
+                            'finish_reason': None,
+                            'index': 0,
+                            'logprobs': None
+                        }
+                    ],
+                    'created': created,
+                    'model': 'model',
+                    'object': 'text_completion',
+                    'system_fingerprint': None
+                }
+            yield json.dumps(payload)
+            await asyncio.sleep(0)
+    return generator()
 
-        data = {
-            'id': request.state.request_id,
-            'choices': [
-                {'finish_reason': 'stop',
-                 'index': 0,
-                 'logprobs': None,
-                 'message': {
-                     'content': ''.join(tokens),
-                     'role': 'assistant',
-                     'function_call': None,
-                     'tool_calls': None
-                 },
-                 'stop_reason': None
-                 }
-            ],
-            'created': created,
-            'model': 'model',
-            'object': 'chat.completion',
-            'system_fingerprint': None,
-            'usage': {
-                'completion_tokens': len(tokens),
-                'prompt_tokens': len(inputs),
-                'total_tokens': len(inputs) + len(tokens),
-            }
+async def handle_non_stream_response(func, inputs, created, request_id, stream_type="completion"):
+    tokens = []
+    async for data in func:
+        if isinstance(data, str):
+            tokens.append(data)
+
+    output_text = ''.join(tokens)
+    base = {
+        'id': request_id,
+        'created': created,
+        'model': 'model',
+        'system_fingerprint': None,
+        'usage': {
+            'completion_tokens': len(tokens),
+            'prompt_tokens': len(inputs),
+            'total_tokens': len(inputs) + len(tokens),
         }
-        r = data
+    }
 
-    if form.stream:
-        return EventSourceResponse(r, headers={
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
+    if stream_type == "chat":
+        base.update({
+            'object': 'chat.completion',
+            'choices': [
+                {
+                    'finish_reason': 'stop',
+                    'index': 0,
+                    'logprobs': None,
+                    'message': {
+                        'content': output_text,
+                        'role': 'assistant',
+                        'function_call': None,
+                        'tool_calls': None
+                    }
+                }
+            ]
         })
     else:
-        return r
+        base.update({
+            'object': 'text_completion',
+            'choices': [
+                {
+                    'finish_reason': 'stop',
+                    'index': 0,
+                    'logprobs': None,
+                    'text': output_text,
+                }
+            ]
+        })
+    return base
+
+async def handle_completion(form, request, tokenizer, is_chat=False):
+    created = int(time.time())
+    request_id = request.state.request_id
+
+    if is_chat:
+        prompt = tokenizer.apply_chat_template(form.messages, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt = form.prompt
+
+    inputs = tokenizer.encode(prompt, return_tensors='pt', add_special_tokens=False)[0]
+
+    func = stream(inputs=inputs, created=created, form=form, request=request)
+    stream_type = "chat" if is_chat else "completion"
+
+    if form.stream:
+        return EventSourceResponse(
+            await handle_stream_response(func, created, request_id, stream_type),
+            headers={
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+            }
+        )
+    else:
+        return await handle_non_stream_response(func, inputs, created, request_id, stream_type)
+
+@app.post('/completions')
+async def completions_main(form: CompletionForm, request: Request = None):
+    return await handle_completion(form, request, tokenizer, is_chat=False)
+
+@app.post('/chat/completions')
+async def chat_completions_main(form: ChatCompletionForm, request: Request = None):
+    return await handle_completion(form, request, tokenizer, is_chat=True)
 
 @app.on_event("startup")
 async def startup_event():
@@ -480,7 +541,7 @@ async def startup_event():
     app.state.background_step = asyncio.create_task(step())
 
     logging.info('warming up')
-    form = ChatCompletionForm()
+    
     dummy_scope = {
         "type": "http",
         "http_version": "1.1",
@@ -499,6 +560,7 @@ async def startup_event():
     for _ in tqdm(range(2), desc='warming up FlashInfer'):
         request = Request(dummy_scope.copy(), receive=receive)
         request.state.request_id = 'dummy'
+        form = ChatCompletionForm()
         r = await chat_completions_main(form=form, request=request)
         manager.free(request.state.request_id)
     
