@@ -161,6 +161,56 @@ python3 -m unittest test.manager
 python3 -m unittest test.manager_append
 ```
 
+## Benchmark
+
+1. We benchmark on 4096 prefilling and 384 decoding with ignore EOS.
+2. Benchmark run on a single RTX 3090 Ti.
+
+```python
+python3 benchmark.py \
+--model "model" \
+--save "benchmark/Llama-3.2-1B-Instruct-warmup" \
+--rps-list "5" \
+--start_token "<|start_header_id|>" --start_token_length 4096
+
+python3 benchmark.py \
+--model "model" \
+--save "benchmark/Llama-3.2-1B-Instruct" \
+--rps-list "5,10,25,50,100" \
+--start_token "<|start_header_id|>" --start_token_length 4096
+```
+
+### vLLM
+
+We benchmark with vLLM 0.10.0 disabled prefix caching,
+
+```bash
+./vllm/bin/vllm serve "meta-llama/Llama-3.2-1B-Instruct" \
+--served-model-name "model" \
+--tensor_parallel_size "1" \
+--no-enable-prefix-caching \
+--max-model-len=8192 \
+--port 7088
+```
+
+After that run the benchmark,
+
+```bash
+python3 benchmark.py \
+--model "model" \
+--url "http://localhost:7088/v1/completions" \
+--save "benchmark/Llama-3.2-1B-Instruct-vllm-warmup" \
+--rps-list "5" \
+--start_token "<|start_header_id|>" --start_token_length 4096
+
+python3 benchmark.py \
+--model "model" \
+--url "http://localhost:7088/v1/completions" \
+--save "benchmark/Llama-3.2-1B-Instruct-vllm" \
+--rps-list "5,10,25,50,100" \
+--start_token "<|start_header_id|>" --start_token_length 4096
+```
+
 ## Stress test
 
 ```bash
