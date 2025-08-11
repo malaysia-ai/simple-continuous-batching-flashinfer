@@ -5,6 +5,7 @@ Simple continuous batching CausalLM from HuggingFace Transformer using FlashInfe
 1. Simple page KV cache manager.
 2. Torch compile support.
 3. FP32 support but downcast and upcast attention forward.
+4. Support top-k, top-p, temperature and repetition penalty for sampling.
 
 ## how to install
 

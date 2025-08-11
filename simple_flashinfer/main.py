@@ -96,12 +96,16 @@ def flashinfer_attention(
 
 def load_model():
     global tokenizer, model, manager
-    global num_layers, num_heads, num_key_value_heads, head_dim, vocab_size
+    global num_layers, num_heads, num_key_value_heads, head_dim, vocab_size, eos_token_id
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, attn_implementation="flashinfer_attention", 
         torch_dtype = args.model_dtype).eval().cuda()
+    eos_token_id = model.generation_config.eos_token_id
+    if not isinstance(eos_token_id, list):
+        eos_token_id = [eos_token_id]
+    eos_token_id = torch.tensor(eos_token_id).cuda()
     config = model.config
     num_layers = config.num_hidden_layers
     num_heads = config.num_attention_heads
@@ -157,6 +161,7 @@ num_heads = None
 num_key_value_heads = None
 head_dim = None
 vocab_size = None
+eos_token_id = None
 AttentionInterface.register("flashinfer_attention", flashinfer_attention)
 workspace_buffer_prefill = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer_prefill, "NHD")
@@ -344,6 +349,9 @@ async def stream(inputs, created, form, request):
     top_p = torch.tensor([top_p]).to(torch.float32).cuda()
 
     prefill_l = torch.tensor([initial_length]).cuda()
+
+    repetition_penalty = max(1e-5, form.repetition_penalty)
+    repetition_penalty_cuda = torch.tensor(repetition_penalty).cuda()
     
     for k in range(form.max_tokens):
         is_disconnected = await request.is_disconnected()
@@ -363,15 +371,15 @@ async def stream(inputs, created, form, request):
         out = await future
         idx_next, token = out
 
-        if form.repetition_penalty > 1:
-            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= form.repetition_penalty
+        if repetition_penalty > 1:
+            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] /= repetition_penalty_cuda
         else:
-            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= form.repetition_penalty
+            manager.mask_penalty[manager.batch_to_seq_len[uuid], idx_next[0]] *= repetition_penalty_cuda
 
         if k == 0:
             request.state.time_first_token = time.time()
         
-        if not form.ignore_eos and idx_next[0] == tokenizer.eos_token_id:
+        if not form.ignore_eos and idx_next[0] in eos_token_id:
             break
 
         if args.torch_compile:
