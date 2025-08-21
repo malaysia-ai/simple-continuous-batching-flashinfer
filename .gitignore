@@ -6,3 +6,6 @@ logs
 out
 output.log
 benchmark/*warmup
+decode-*.json
+prefill-*.json
+!plot-benchmark.ipynb
