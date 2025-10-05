@@ -12,13 +12,13 @@ Simple continuous batching CausalLM from HuggingFace Transformer using FlashInfe
 Using PIP with git,
 
 ```bash
-pip3 install git+https://github.com/huseinzol05/simple-continuous-batching-flashinfer
+pip3 install git+https://github.com/malaysia-ai/simple-continuous-batching-flashinfer
 ```
 
 Or you can git clone,
 
 ```bash
-git clone https://github.com/huseinzol05/simple-continuous-batching-flashinfer && cd simple-continuous-batching-flashinfer
+git clone https://github.com/malaysia-ai/simple-continuous-batching-flashinfer && cd simple-continuous-batching-flashinfer
 ```
 
 ## how to local
@@ -211,6 +211,16 @@ python3 benchmark.py \
 --rps-list "5,10,25,50,100" \
 --start_token "<|start_header_id|>" --start_token_length 4096
 ```
+
+### Comparison
+
+#### First Time Token VS Concurrency
+
+<img src="pics/ft-vs-concurrency.png" width="50%">
+
+#### Average Time Token VS Concurrency
+
+<img src="pics/avg-vs-concurrency.png" width="50%">
 
 ## Stress test
 
