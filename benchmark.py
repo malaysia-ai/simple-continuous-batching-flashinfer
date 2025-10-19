@@ -41,10 +41,10 @@ async def stress_test(index, url, model, start_token, start_token_length):
         'total_token': count,
     }
 
-async def run_stress_test(url, model, start_token, start_token_length, requests_per_second):
+async def run_stress_test(url, model, start_token, start_token_length, concurrency):
     tasks = [
         stress_test(i, url, model, start_token, start_token_length)
-        for i in range(requests_per_second)
+        for i in range(concurrency)
     ]
     results = await asyncio.gather(*tasks)
     return results
@@ -55,16 +55,16 @@ async def run_stress_test(url, model, start_token, start_token_length, requests_
 @click.option('--start_token', default='<|eot_id|>', help='start token.')
 @click.option('--start_token_length', default = 1024, help='start token length.')
 @click.option('--save', required=True, help='save folder name.')
-@click.option('--rps-list', default='10,20,30,40,50,60,70,80,90,100',
-              help='Comma-separated list of RPS (requests per second) values to test.')
-def main(url, model, start_token, start_token_length, save, rps_list):
+@click.option('--concurrency-list', default='10,20,30,40,50,60,70,80,90,100',
+              help='Comma-separated list of concurrency values to test.')
+def main(url, model, start_token, start_token_length, save, concurrency_list):
     os.makedirs(save, exist_ok = True)
-    rps_values = [int(rps) for rps in rps_list.split(',')]
+    rps_values = [int(concurrency) for concurrency in concurrency_list.split(',')]
 
     async def run_all():
-        for rps in rps_values:
-            print(f"\nTesting with {rps} RPS")
-            results = await run_stress_test(url, model, start_token, start_token_length, rps)
+        for concurrency in concurrency_values:
+            print(f"\nTesting with {concurrency} concurrency")
+            results = await run_stress_test(url, model, start_token, start_token_length, concurrency)
             first_token_avg = sum(res["first_token"] for res in results if res["first_token"] is not None) / len(results)
             total_response_avg = sum(res["total_response"] for res in results) / len(results)
             total_token = sum(res["total_token"] for res in results)
@@ -76,7 +76,7 @@ def main(url, model, start_token, start_token_length, save, rps_list):
                 'average_token': total_token / len(results),
             }
 
-            with open(f"{save}/{rps}RPS.json", "w") as outfile:
+            with open(f"{save}/{concurrency}concurrency.json", "w") as outfile:
                 json.dump(results_data, outfile, indent=4)
 
     asyncio.run(run_all())
