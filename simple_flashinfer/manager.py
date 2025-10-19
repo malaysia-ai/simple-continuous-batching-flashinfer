@@ -3,7 +3,6 @@ import math
 import pynvml
 import flashinfer
 import os
-from transformers.cache_utils import Cache
 
 def get_total_free_memory(index=0):
     pynvml.nvmlInit()
@@ -62,18 +61,6 @@ class AutoKVCacheManager:
         self.batch_to_seq_len = {}
         self.prefill_layer_idx = 0
         self.decode_layer_idx = 0
-
-    def get_qo_indptr(self, batch_ids):
-        indptr = [0]
-        for bid in batch_ids:
-            total = self.batch_to_total_tokens.get(bid, 0)
-            indptr.append(indptr[-1] + total)
-        return torch.tensor(indptr, dtype=torch.int32, device="cuda")
-    
-    def get_num_pages_per_batch(self):
-        return torch.tensor(
-            [len(self.batch_to_blocks[bid]) for bid in batch_ids], 
-            dtype=torch.int32, device="cuda")
 
     def allocate(self, batch_id, total_tokens):
         num_pages = math.ceil(total_tokens / self.block_size)

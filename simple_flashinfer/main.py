@@ -11,6 +11,7 @@ from .utils import (
     block_diagonal_concat_inverted,
 )
 from tqdm import tqdm
+from contextlib import nullcontext
 import torch
 import json
 import asyncio
@@ -171,6 +172,19 @@ empty_length = torch.tensor([0]).cuda()
 decode_length = torch.tensor([1]).cuda()
 prefill_queue = asyncio.Queue()
 step_queue = asyncio.Queue()
+
+if args.torch_profiling:
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        with_stack=True,
+    )
+else:
+    profiler = nullcontext()
+
 app = FastAPI()
 
 @app.middleware("http")
@@ -220,6 +234,7 @@ async def add_request_id_and_time(request: Request, call_next):
     return response
 
 async def process_queue(queue, wrapper, prefill):
+    global_step = 0
     need_sleep = True
     while True:
         if need_sleep:
@@ -241,92 +256,102 @@ async def process_queue(queue, wrapper, prefill):
         if not len(batch):
             continue
 
-        futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
-        temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
-        lengths_cpu = [inp.shape[0] for inp in inputs]
+        with profiler as prof:
+            futures, inputs, position_ids, uuids = zip(*[(b[0], b[1], b[2], b[3]) for b in batch])
+            temperature, top_k, top_p, lengths = zip(*[(b[4], b[5], b[6], b[7]) for b in batch])
+            lengths_cpu = [inp.shape[0] for inp in inputs]
 
-        try:
-            position_ids = (
-                torch.cat([torch.arange(l) for l in lengths_cpu])
-                if prefill
-                else torch.tensor(position_ids)
-            )[None].cuda()
+            try:
+                position_ids = (
+                    torch.cat([torch.arange(l) for l in lengths_cpu])
+                    if prefill
+                    else torch.tensor(position_ids)
+                )[None].cuda()
 
-            for no, l in enumerate(lengths_cpu):
+                for no, l in enumerate(lengths_cpu):
+                    if prefill:
+                        manager.allocate(uuids[no], l)
+                    else:
+                        manager.append_tokens(uuids[no], l)
+                    
+                input_ids = torch.concat(inputs)[None]
+                lengths = torch.concat([empty_length] + list(lengths))
+                append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
+
+                kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
                 if prefill:
-                    manager.allocate(uuids[no], l)
+                    wrapper.plan(
+                        append_indptr,
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_len,
+                        num_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        manager.block_size,
+                        causal=True,
+                        q_data_type=args.torch_dtype,
+                    )
                 else:
-                    manager.append_tokens(uuids[no], l)
-                
-            input_ids = torch.concat(inputs)[None]
-            lengths = torch.concat([empty_length] + list(lengths))
-            append_indptr = torch.cumsum(lengths, dim=-1).to(torch.int32)
+                    wrapper.plan(
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_len,
+                        num_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        manager.block_size,
+                        pos_encoding_mode="NONE",
+                        q_data_type=args.torch_dtype,
+                    )
+                setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
+                setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
 
-            kv_indices, kv_indptr, kv_last_page_len = manager.get_append_metadata(uuids)
-            if prefill:
-                wrapper.plan(
-                    append_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_len,
-                    num_heads,
-                    num_key_value_heads,
-                    head_dim,
-                    manager.block_size,
-                    causal=True,
-                    q_data_type=args.torch_dtype,
+                forward = model if prefill else decode
+                output = forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    wrapper=wrapper,
+                    manager=manager,
+                    prefill=prefill,
+                    append_indptr=append_indptr,
                 )
-            else:
-                wrapper.plan(
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_len,
-                    num_heads,
-                    num_key_value_heads,
-                    head_dim,
-                    manager.block_size,
-                    pos_encoding_mode="NONE",
-                    q_data_type=args.torch_dtype,
-                )
-            setattr(manager, "prefill_layer_idx" if prefill else "decode_layer_idx", 0)
-            setattr(manager, "prefill_batch_ids" if prefill else "decode_batch_ids", uuids)
+                logits = output.logits[0, append_indptr[1:] - 1]
+                temperature = torch.concat(temperature)[None].T
+                top_k = torch.concat(top_k)
+                top_p = torch.concat(top_p)
 
-            forward = model if prefill else decode
-            output = forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                use_cache=False,
-                wrapper=wrapper,
-                manager=manager,
-                prefill=prefill,
-                append_indptr=append_indptr,
-            )
-            logits = output.logits[0, append_indptr[1:] - 1]
-            temperature = torch.concat(temperature)[None].T
-            top_k = torch.concat(top_k)
-            top_p = torch.concat(top_p)
+                mask_penalty = []
+                for uuid in uuids:
+                    mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
+                mask_penalty = torch.stack(mask_penalty)
 
-            mask_penalty = []
-            for uuid in uuids:
-                mask_penalty.append(manager.mask_penalty[manager.batch_to_seq_len[uuid]])
-            mask_penalty = torch.stack(mask_penalty)
+                logits = logits / mask_penalty
+                logits = logits / temperature
 
-            logits = logits / mask_penalty
-            logits = logits / temperature
+                idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                    logits, top_k=top_k, top_p=top_p, deterministic=True,
+                )[None].T
 
-            idx_next = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                logits, top_k=top_k, top_p=top_p, deterministic=True,
-            )[None].T
+                tokens = tokenizer.batch_decode(idx_next)
 
-            tokens = tokenizer.batch_decode(idx_next)
+                for i, fut in enumerate(futures):
+                    fut.set_result((idx_next[i], tokens[i]))
 
-            for i, fut in enumerate(futures):
-                fut.set_result((idx_next[i], tokens[i]))
-
-        except Exception as e:
-            for future in futures:
-                if not future.done():
-                    future.set_exception(e)
+            except Exception as e:
+                for future in futures:
+                    if not future.done():
+                        future.set_exception(e)
+        
+        if args.torch_profiling:
+            try:
+                mode = 'prefill' if prefill else 'decode'
+                prof.export_chrome_trace(f'{mode}-{global_step}.json')
+            except Exception as e:
+                print(e)
+        
+        global_step += 1
 
 async def prefill():
     await process_queue(prefill_queue, prefill_wrapper, prefill=True)
@@ -575,7 +600,7 @@ async def startup_event():
     if args.torch_compile:
         global decode
 
-        decode = torch.compile(decode, mode=args.torch_compile_mode)
+        decode = torch.compile(decode, mode=args.torch_compile_mode, dynamic=True)
         for i in tqdm(range(args.max_sequence), desc='warming up torch compile'):
             tasks = []
             for k in range(i + 1):
